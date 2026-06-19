@@ -1,0 +1,923 @@
+#!/usr/bin/env python3
+"""
+computer-use — Universal Desktop + Browser Automation CLI
+========================================================
+
+A standalone tool that any agent (Claude Code, OpenClaw, OpenCode, etc.)
+can call for desktop and browser automation. All output is JSON.
+
+Two channels:
+  - Native ops: cliclick (mouse/keyboard), screencapture, Apple Vision OCR,
+    macOS Accessibility API — works on any Mac app.
+  - Browser CDP: connects to Chrome via chrome.debugger (extension mode)
+    or WebSocket remote debugging port — works on browser content.
+
+Usage:
+  computer-use screenshot                    Take screenshot, return path
+  computer-use screenshot --ocr              Take screenshot + OCR text
+  computer-use ocr <image_path>              Run Apple Vision OCR on image
+  computer-use tree                          Get AX tree of frontmost app
+  computer-use click <x> <y>                 Physical click at screen coords
+  computer-use type <text>                   Type text at current focus
+  computer-use key <shortcut>                Press key combo (e.g. cmd+r)
+  computer-use scroll <dx> [dy]              Scroll at current position
+  computer-use mouse <x> <y>                 Move mouse to screen coords
+  computer-use position                      Get current mouse position
+
+  computer-use cdp-click <selector>          Browser click by CSS selector
+  computer-use cdp-type <selector> <text>     Browser fill input
+  computer-use cdp-screenshot                Browser page screenshot (base64)
+  computer-use cdp-file <selector> <path>     Browser file input
+  computer-use cdp-eval <js>                 Browser evaluate JS
+  computer-use cdp-scroll <dx> [dy]          Browser scroll
+  computer-use cdp-interactive               List all interactive elements
+
+  computer-use start-chrome                  Launch Chrome with debug port
+  computer-use serve [--port PORT]           HTTP server for agent integration
+
+Environment:
+  CU_CDP_PORT  Chrome remote debugging port (default 9222)
+  CU_NATIVE    Path to native bridge (default auto-detect)
+"""
+
+import argparse
+import base64
+import json
+import os
+import shutil
+import socket
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+import urllib.error
+from pathlib import Path
+
+# ── Paths ──────────────────────────────────────────────────────────
+
+PROJECT_DIR = Path(__file__).resolve().parent.parent
+NATIVE_HOST_DIR = PROJECT_DIR / "native-host"
+OCR_BIN = str(NATIVE_HOST_DIR / "ocr")
+CLICKLICK = shutil.which("cliclick") or "/opt/homebrew/bin/cliclick"
+MAC_USE = os.path.expanduser("~/.local/bin/mac-use")
+SCREENSHOT_DIR = Path(os.path.expanduser("~/.cache/mac-use-screenshots"))
+SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
+
+CDP_PORT = int(os.environ.get("CU_CDP_PORT", "9222"))
+
+
+# ── Native Operations ─────────────────────────────────────────────
+
+def native_screenshot():
+    """Take a full-screen screenshot via screencapture."""
+    ts = int(time.time() * 1000)
+    path = str(SCREENSHOT_DIR / f"cu_{ts}.png")
+    subprocess.run(["screencapture", "-x", path], timeout=10, capture_output=True)
+    if not os.path.exists(path):
+        return {"status": "failed", "error": "screencapture failed"}
+    return {"status": "ok", "path": path}
+
+
+def native_ocr(image_path=None):
+    """Run Apple Vision OCR on an image. Takes screenshot if no path given."""
+    if image_path:
+        path = image_path
+    else:
+        result = native_screenshot()
+        if result["status"] != "ok":
+            return result
+        path = result["path"]
+
+    if not os.path.exists(path):
+        return {"status": "failed", "error": f"Image not found: {path}"}
+
+    try:
+        r = subprocess.run([OCR_BIN, path], capture_output=True, text=True, timeout=30)
+        if r.returncode != 0:
+            return {"status": "failed", "error": r.stderr.strip() or r.stdout.strip()}
+        data = json.loads(r.stdout)
+        # Add pixel-level coordinates for convenience
+        iw, ih = data["imageWidth"], data["imageHeight"]
+        for block in data["blocks"]:
+            block["px"] = round(block["x"] * iw)
+            block["py"] = round((1 - block["y"] - block["h"]) * ih)
+            block["pw"] = round(block["w"] * iw)
+            block["ph"] = round(block["h"] * ih)
+        return {
+            "status": "ok",
+            "path": path,
+            "imageWidth": iw,
+            "imageHeight": ih,
+            "blocks": data["blocks"]
+        }
+    except json.JSONDecodeError as e:
+        return {"status": "failed", "error": f"JSON parse: {e}"}
+    except Exception as e:
+        return {"status": "failed", "error": str(e)}
+
+
+def native_accessibility_tree():
+    """Get AX UI element tree of the frontmost app."""
+    script = '''
+tell application "System Events"
+    set frontApp to name of first process whose frontmost is true
+end tell
+tell application "System Events"
+    tell process frontApp
+        set windowCount to count of windows
+        if windowCount = 0 then return "{\\"windows\\":0}"
+        set allUI to every UI element of window 1
+        set output to ""
+        repeat with el in allUI
+            try
+                set r to role of el
+                set d to ""
+                try; set d to description of el; end try
+                set t to ""
+                try; set t to title of el; end try
+                set p to position of el
+                set sz to size of el
+                set output to output & r & "|" & t & "|" & d & "|" & (item 1 of p) & "," & (item 2 of p) & "," & (item 1 of sz) & "x" & (item 2 of sz) & "\\n"
+            end try
+        end repeat
+        return output
+    end tell
+end tell
+'''
+    r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=15)
+    if r.returncode != 0:
+        return {"status": "failed", "error": r.stderr.strip()}
+
+    elements = []
+    for line in r.stdout.strip().split("\n"):
+        if not line.strip() or line.strip() == '{"windows":0}':
+            continue
+        parts = line.split("|", 3)
+        if len(parts) == 4:
+            role, title, desc, pos = parts
+            try:
+                wp = pos.replace("x", ",").split(",")
+                elements.append({
+                    "role": role,
+                    "title": title if title != "missing value" else "",
+                    "description": desc if desc != "missing value" else "",
+                    "x": int(wp[0]), "y": int(wp[1]), "w": int(wp[2]), "h": int(wp[3])
+                })
+            except (ValueError, IndexError):
+                pass
+
+    return {"status": "ok", "elements": elements, "count": len(elements)}
+
+
+def native_mouse_click(x, y):
+    subprocess.run([CLICKLICK, f"c:{x},{y}"], timeout=5, capture_output=True)
+    return {"status": "ok", "action": "click", "x": x, "y": y}
+
+
+def native_mouse_move(x, y):
+    subprocess.run([CLICKLICK, f"m:{x},{y}"], timeout=5, capture_output=True)
+    return {"status": "ok", "action": "move", "x": x, "y": y}
+
+
+def native_mouse_position():
+    r = subprocess.run([CLICKLICK, "p"], capture_output=True, text=True, timeout=5)
+    if r.returncode == 0 and r.stdout.strip():
+        parts = r.stdout.strip().split(",")
+        return {"status": "ok", "x": int(parts[0]), "y": int(parts[1])}
+    return {"status": "failed", "error": r.stderr.strip()}
+
+
+def native_scroll(dx, dy, x=None, y=None):
+    args = [CLICKLICK]
+    if dx == 0:
+        args.append(f"w:{dy}")
+    else:
+        # cliclick doesn't support horizontal scroll directly, use AppleScript
+        ascript = f'tell application "System Events" to key code 123'
+        subprocess.run(["osascript", "-e", ascript], timeout=5)
+        return {"status": "ok", "note": "horizontal scroll simulated via arrow key", "dx": dx}
+
+    if x is not None and y is not None:
+        args.append(f"{x},{y}")
+    subprocess.run(args, timeout=5, capture_output=True)
+    return {"status": "ok", "dx": dx, "dy": dy}
+
+
+def native_type_text(text):
+    # Use clipboard paste for reliable unicode
+    p = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
+    p.communicate(text.encode("utf-8"))
+    time.sleep(0.1)
+    subprocess.run(
+        ["osascript", "-e",
+         'tell application "System Events" to keystroke "v" using {command down}'],
+        timeout=5, capture_output=True
+    )
+    return {"status": "ok", "length": len(text), "method": "paste"}
+
+
+def native_key_press(shortcut):
+    parts = shortcut.lower().split("+")
+    key = parts[-1]
+    modifiers = parts[:-1]
+
+    mod_map = {
+        "cmd": "command down", "command": "command down",
+        "ctrl": "control down", "control": "control down",
+        "alt": "option down", "option": "option down",
+        "shift": "shift down",
+    }
+
+    using = ""
+    mods = ", ".join(m for m in [mod_map.get(m) for m in modifiers if m in mod_map] if m)
+    if mods:
+        using = f" using {{{mods}}}"
+
+    special = {
+        "enter": "return", "return": "return", "tab": "tab",
+        "escape": "escape", "esc": "escape", "delete": "delete",
+        "backspace": "delete", "space": "space", "up": "up-arrow",
+        "down": "down-arrow", "left": "left-arrow", "right": "right-arrow",
+    }
+
+    if key in special:
+        script = f'tell application "System Events" to keystroke {special[key]}{using}'
+    else:
+        script = f'tell application "System Events" to keystroke "{key}"{using}'
+
+    subprocess.run(["osascript", "-e", script], timeout=5, capture_output=True)
+    return {"status": "ok", "shortcut": shortcut}
+
+
+# ── CDP Operations (Chrome DevTools Protocol) ─────────────────────
+
+def cdp_discover_tabs():
+    """Find Chrome tabs via DevTools Protocol HTTP endpoint."""
+    try:
+        url = f"http://localhost:{CDP_PORT}/json"
+        req = urllib.request.urlopen(url, timeout=3)
+        return json.loads(req.read().decode())
+    except (urllib.error.URLError, ConnectionRefusedError, json.JSONDecodeError) as e:
+        return None
+
+
+def cdp_send(method, params=None, tab_id=None, timeout_sec=10):
+    """Send a CDP command via WebSocket to Chrome tab.
+
+    Requires websocket-client: pip3 install websocket-client
+    """
+    try:
+        import websocket
+    except ImportError:
+        # Return instructions if library not available
+        tabs = cdp_discover_tabs()
+        if not tabs:
+            return {"status": "failed", "error": f"Cannot connect to Chrome at port {CDP_PORT}"}
+        return {
+            "status": "failed",
+            "error": "websocket-client not installed",
+            "install": "pip3 install websocket-client",
+            "tabCount": len(tabs)
+        }
+
+    # Find the tab
+    tabs = cdp_discover_tabs()
+    if not tabs:
+        return {"status": "failed", "error": f"Cannot connect to Chrome at port {CDP_PORT}"}
+
+    target = None
+    for t in tabs:
+        if tab_id and t["id"] == tab_id:
+            target = t
+            break
+        if not tab_id and t.get("type") == "page" and t.get("url", "").startswith("http"):
+            target = t
+            break
+    if not target:
+        target = tabs[0]
+
+    ws_url = target["webSocketDebuggerUrl"]
+    msg_id = int(time.time() * 1000)
+
+    try:
+        ws = websocket.create_connection(ws_url, timeout=timeout_sec)
+        ws.send(json.dumps({"id": msg_id, "method": method, "params": params or {}}))
+
+        # Wait for response with matching id
+        start = time.time()
+        while time.time() - start < timeout_sec:
+            resp = json.loads(ws.recv())
+            if resp.get("id") == msg_id:
+                ws.close()
+                if "error" in resp:
+                    return {"status": "failed", "error": resp["error"].get("message", str(resp["error"]))}
+                return {"status": "ok", "result": resp.get("result")}
+        ws.close()
+        return {"status": "failed", "error": "Response timeout"}
+    except Exception as e:
+        return {"status": "failed", "error": str(e)}
+
+
+def cdp_process_tabs(verbose=False):
+    """List and format available tabs."""
+    tabs = cdp_discover_tabs()
+    if not tabs:
+        return {"status": "failed", "error": f"No Chrome with --remote-debugging-port={CDP_PORT}"}
+
+    result = []
+    for t in tabs:
+        result.append({
+            "id": t.get("id"),
+            "title": t.get("title", "")[:80],
+            "url": t.get("url", "")[:120],
+            "type": t.get("type", "page"),
+        })
+    return {"status": "ok", "tabs": result, "count": len(result)}
+
+
+# ── Utility ───────────────────────────────────────────────────────
+
+def json_output(data):
+    """Print JSON and exit."""
+    json.dump(data, sys.stdout, ensure_ascii=False, indent=2)
+    print()
+
+
+# ── Modes ─────────────────────────────────────────────────────────
+
+def run_screenshot(args):
+    if args.ocr:
+        result = native_ocr()
+        json_output(result)
+    else:
+        result = native_screenshot()
+        json_output(result)
+
+
+def run_ocr(args):
+    result = native_ocr(args.image)
+    json_output(result)
+
+
+def run_tree(args):
+    result = native_accessibility_tree()
+    json_output(result)
+
+
+def run_click(args):
+    result = native_mouse_click(args.x, args.y)
+    json_output(result)
+
+
+def run_type(args):
+    result = native_type_text(args.text)
+    json_output(result)
+
+
+def run_key(args):
+    result = native_key_press(args.shortcut)
+    json_output(result)
+
+
+def run_scroll(args):
+    result = native_scroll(args.dx, args.dy or 0)
+    json_output(result)
+
+
+def run_mouse(args):
+    result = native_mouse_move(args.x, args.y)
+    json_output(result)
+
+
+def run_position(args):
+    result = native_mouse_position()
+    json_output(result)
+
+
+def run_start_chrome(args):
+    """Launch Chrome with remote debugging port. Keeps existing instance."""
+    port = args.port or CDP_PORT
+    try:
+        # Check if Chrome is already running with debug port
+        tabs = cdp_discover_tabs()
+        if tabs:
+            json_output({"status": "ok", "message": f"Chrome already running with CDP on port {port}", "tabs": len(tabs)})
+            return
+
+        # Launch Chrome with debug port
+        chrome_paths = [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        ]
+        chrome = None
+        for p in chrome_paths:
+            if os.path.exists(p):
+                chrome = p
+                break
+
+        if not chrome:
+            json_output({"status": "failed", "error": "Chrome not found"})
+            return
+
+        # Use open -n to avoid opening a new instance if already running
+        subprocess.Popen([
+            "open", "-a", "Google Chrome", "-n", "--args",
+            f"--remote-debugging-port={port}",
+            "--no-first-run",
+        ])
+        json_output({"status": "ok", "message": f"Chrome launched with CDP on port {port}"})
+    except Exception as e:
+        json_output({"status": "failed", "error": str(e)})
+
+
+def run_cdp_click(args):
+    """CDP click by coordinates or selector."""
+    if hasattr(args, 'selector') and args.selector:
+        # Find element position via Runtime.evaluate
+        js = """(function(){
+            var el = document.querySelector(SEL);
+            if (!el) return {error: 'not found'};
+            var r = el.getBoundingClientRect();
+            return {x: Math.round(r.x + r.width/2), y: Math.round(r.y + r.height/2), tag: el.tagName, text: (el.innerText||'').trim().substring(0,60)};
+        })()""".replace("SEL", json.dumps(args.selector))
+        eval_result = cdp_send("Runtime.evaluate", {
+            "expression": js,
+            "returnByValue": True
+        })
+        if eval_result["status"] != "ok":
+            json_output(eval_result)
+            return
+        pos = eval_result["result"].get("result", {}).get("value", {})
+        if pos.get("error"):
+            json_output({"status": "failed", "error": pos["error"]})
+            return
+        x, y = pos["x"], pos["y"]
+        result = cdp_send("Input.dispatchMouseEvent", {
+            "type": "mouseMoved", "x": x, "y": y, "button": "left"
+        })
+        result = cdp_send("Input.dispatchMouseEvent", {
+            "type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 1
+        })
+        result = cdp_send("Input.dispatchMouseEvent", {
+            "type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 1
+        })
+        json_output({"status": "ok", "method": "cdp", "selector": args.selector, "x": x, "y": y, "element": pos})
+    else:
+        # Direct coordinates
+        result = cdp_send("Input.dispatchMouseEvent", {
+            "type": "mousePressed", "x": args.x, "y": args.y, "button": "left", "clickCount": 1
+        })
+        result = cdp_send("Input.dispatchMouseEvent", {
+            "type": "mouseReleased", "x": args.x, "y": args.y, "button": "left", "clickCount": 1
+        })
+        json_output(result)
+
+
+def run_cdp_type(args):
+    """CDP fill input by selector."""
+    js = """(function(){
+        var el = document.querySelector(SEL);
+        if (!el) return {error: 'not found'};
+        el.focus();
+        var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set
+            || Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
+        if (setter) setter.call(el, VAL);
+        el.dispatchEvent(new Event('input', {bubbles: true}));
+        el.dispatchEvent(new Event('change', {bubbles: true}));
+        return {filled: true, value: VAL_TRUNC};
+    })()""".replace("SEL", json.dumps(args.selector)).replace("VAL", json.dumps(args.text)).replace("VAL_TRUNC", json.dumps(args.text[:100]))
+    result = cdp_send("Runtime.evaluate", {
+        "expression": js,
+        "returnByValue": True
+    })
+    json_output(result)
+
+
+def run_cdp_eval(args):
+    """CDP evaluate JavaScript."""
+    result = cdp_send("Runtime.evaluate", {"expression": args.expression, "returnByValue": True})
+    json_output(result)
+
+
+def run_cdp_interactive(args):
+    # Get interactive elements via CDP evaluate
+    js = """
+    (function(){
+        var sel='button,a,input,textarea,select,[role="button"],[role="checkbox"],[role="radio"]';
+        var els=document.querySelectorAll(sel);
+        var out=[];
+        for(var i=0;i<els.length&&i<200;i++){
+            var r=els[i].getBoundingClientRect();
+            if(r.width>0&&r.height>0&&r.x>=0&&r.y>=0){
+                out.push({
+                    index:i,tag:els[i].tagName,
+                    text:(els[i].innerText||'').trim().substring(0,80),
+                    type:(els[i].type||''),id:(els[i].id||''),
+                    x:Math.round(r.x),y:Math.round(r.y),
+                    w:Math.round(r.width),h:Math.round(r.height),
+                    cx:Math.round(r.x+r.width/2),cy:Math.round(r.y+r.height/2)
+                });
+            }
+        }
+        return out;
+    })()
+    """
+    result = cdp_send("Runtime.evaluate", {"expression": js, "returnByValue": True})
+    json_output(result)
+
+
+def run_cdp_screenshot(args):
+    result = cdp_send("Page.captureScreenshot", {"format": "png"})
+    if result.get("status") == "ok" and result.get("result", {}).get("data"):
+        data = result["result"]["data"]
+        path = str(SCREENSHOT_DIR / f"cu_cdp_{int(time.time()*1000)}.png")
+        with open(path, "wb") as f:
+            f.write(base64.b64decode(data))
+        json_output({"status": "ok", "path": path, "size": len(data)})
+    else:
+        json_output(result)
+
+
+def run_cdp_file(args):
+    result = cdp_send("DOM.setFileInputFiles", {
+        "files": [args.path]
+    })
+    json_output(result)
+
+
+def run_cdp_tabs(args):
+    result = cdp_process_tabs(args.verbose)
+    json_output(result)
+
+
+def run_step(args):
+    """Execute a step: action → wait → screenshot (for agent verification loop)."""
+    action = args.action or "click"
+    selector = args.selector
+    value = args.value
+
+    if not selector and action not in ("screenshot", "wait"):
+        json_output({"status": "failed", "error": "--selector required for this action"})
+        return
+
+    result = {"step": args.description, "action": action, "status": "ok", "actions": []}
+
+    try:
+        if action == "click" and selector:
+            # Try CDP first (if websocket-client available)
+            try:
+                import websocket  # noqa: F401
+                r = run_cdp_click_raw(args)
+                result["actions"].append({"method": "cdp", "selector": selector, "x": r.get("x"), "y": r.get("y")})
+            except ImportError:
+                # Fallback to native click: get element position first via JS eval
+                r = {"status": "failed", "error": "CDP not available"}
+
+        elif action == "fill" and selector and value:
+            result["actions"].append({"method": "cdp", "selector": selector})
+            # Use CDP fill
+            js = """(function(){
+                var el = document.querySelector(SEL);
+                if (!el) return {error: 'not found'};
+                el.focus();
+                var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set
+                    || Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
+                if (setter) setter.call(el, VAL);
+                el.dispatchEvent(new Event('input', {bubbles: true}));
+                el.dispatchEvent(new Event('change', {bubbles: true}));
+                return {filled: true};
+            })()""".replace("SEL", json.dumps(selector)).replace("VAL", json.dumps(value))
+            cdp_send("Runtime.evaluate", {"expression": js, "returnByValue": True})
+
+        elif action == "screenshot":
+            result["actions"].append({"method": "native"})
+
+        elif action == "wait":
+            time.sleep(float(value or 1))
+            result["actions"].append({"method": "wait", "seconds": float(value or 1)})
+
+    except Exception as e:
+        result["status"] = "failed"
+        result["error"] = str(e)
+
+    # Always take a verification screenshot
+    wait_ms = int(args.wait) if args.wait else 800
+    time.sleep(wait_ms / 1000)
+
+    if args.ocr:
+        ocr_result = native_ocr()
+        result["screenshot"] = ocr_result
+    else:
+        ss = native_screenshot()
+        result["screenshot"] = ss
+
+    json_output(result)
+
+
+def run_cdp_click_raw(args):
+    """CDP click helper used by run_step."""
+    js = """(function(){
+        var el = document.querySelector(SEL);
+        if (!el) return {error: 'not found'};
+        var r = el.getBoundingClientRect();
+        return {x: Math.round(r.x + r.width/2), y: Math.round(r.y + r.height/2), tag: el.tagName};
+    })()""".replace("SEL", json.dumps(args.selector))
+    eval_result = cdp_send("Runtime.evaluate", {"expression": js.strip(), "returnByValue": True})
+    if eval_result["status"] != "ok":
+        return {"error": eval_result.get("error")}
+    pos = eval_result["result"].get("result", {}).get("value", {})
+    if pos.get("error"):
+        return {"error": pos["error"]}
+    x, y = pos["x"], pos["y"]
+    cdp_send("Input.dispatchMouseEvent", {"type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 1})
+    cdp_send("Input.dispatchMouseEvent", {"type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 1})
+    return {"x": x, "y": y}
+
+
+def run_serve(args):
+    """Start HTTP server for agent integration."""
+    port = args.port or 9090
+    host = args.host or "127.0.0.1"
+
+    print(json.dumps({
+        "status": "ok",
+        "message": f"Server starting on {host}:{port}",
+        "endpoints": {
+            "POST /execute": "Run a command (same as CLI args, in JSON body)",
+            "GET /health": "Health check",
+            "POST /step": "Execute step → screenshot → return result+ocr"
+        }
+    }), file=sys.stderr)
+
+    # Start the server
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+    import urllib.parse
+
+    class CUHandler(BaseHTTPRequestHandler):
+        def log_message(self, format, *args):
+            pass  # Quiet
+
+        def _send_json(self, data, status=200):
+            body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            if self.path == "/health":
+                self._send_json({"status": "ok", "service": "computer-use", "version": "1.0.0"})
+            elif self.path == "/status":
+                # Check what's available
+                cliclick_ok = shutil.which("cliclick") is not None
+                ocr_ok = os.path.exists(OCR_BIN)
+                chrome_cdp = cdp_discover_tabs()
+                self._send_json({
+                    "status": "ok",
+                    "cliclick": cliclick_ok,
+                    "ocr": ocr_ok,
+                    "chrome_cdp": isinstance(chrome_cdp, list) and len(chrome_cdp) > 0,
+                    "cdp_port": CDP_PORT,
+                })
+            else:
+                self._send_json({"status": "failed", "error": "Not found"}, 404)
+
+        def do_POST(self):
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(length).decode("utf-8") if length else "{}"
+                data = json.loads(body) if body.strip() else {}
+            except (json.JSONDecodeError, ValueError):
+                self._send_json({"status": "failed", "error": "Invalid JSON"}, 400)
+                return
+
+            if self.path == "/execute":
+                result = self._handle_execute(data)
+                self._send_json(result)
+            elif self.path == "/step":
+                result = self._handle_step(data)
+                self._send_json(result)
+            else:
+                self._send_json({"status": "failed", "error": "Not found"}, 404)
+
+        def _handle_execute(self, data):
+            """Execute a command. data: {command, args...}"""
+            cmd = data.get("command", "")
+            if cmd == "screenshot":
+                if data.get("ocr"):
+                    return native_ocr()
+                return native_screenshot()
+            elif cmd == "ocr":
+                return native_ocr(data.get("path"))
+            elif cmd == "tree":
+                return native_accessibility_tree()
+            elif cmd == "click":
+                return native_mouse_click(data.get("x"), data.get("y"))
+            elif cmd == "type":
+                return native_type_text(data.get("text", ""))
+            elif cmd == "key":
+                return native_key_press(data.get("shortcut", ""))
+            elif cmd == "scroll":
+                return native_scroll(data.get("dx", 0), data.get("dy", 3))
+            elif cmd == "position":
+                return native_mouse_position()
+            elif cmd == "mouse":
+                return native_mouse_move(data.get("x"), data.get("y"))
+            elif cmd == "cdp-tabs":
+                return cdp_process_tabs()
+            elif cmd == "cdp-eval":
+                return cdp_send("Runtime.evaluate", {"expression": data.get("expression", ""), "returnByValue": True})
+            else:
+                return {"status": "failed", "error": f"Unknown command: {cmd}"}
+
+        def _handle_step(self, data):
+            """Execute a step with screenshot verification."""
+            action = data.get("action", "click")
+            selector = data.get("selector")
+            value = data.get("value")
+            wait_ms = int(data.get("wait", 800))
+            do_ocr = data.get("ocr", True)
+
+            result = {"action": action, "status": "ok", "started_at": time.time()}
+
+            try:
+                if action == "click" and selector:
+                    # Try CDP if available
+                    try:
+                        import websocket  # noqa: F401
+                        # Click via CDP evaluate + dispatch
+                        js = """(function(){
+                            var el = document.querySelector(SEL);
+                            if (!el) return {error: 'not found'};
+                            var r = el.getBoundingClientRect();
+                            return {x: Math.round(r.x + r.width/2), y: Math.round(r.y + r.height/2)};
+                        })()""".replace("SEL", json.dumps(selector))
+                        pos_r = cdp_send("Runtime.evaluate", {"expression": js, "returnByValue": True})
+                        if pos_r.get("status") == "ok":
+                            pos = pos_r["result"].get("result", {}).get("value", {})
+                            if pos.get("x"):
+                                cdp_send("Input.dispatchMouseEvent", {"type": "mousePressed", "x": pos["x"], "y": pos["y"], "button": "left", "clickCount": 1})
+                                cdp_send("Input.dispatchMouseEvent", {"type": "mouseReleased", "x": pos["x"], "y": pos["y"], "button": "left", "clickCount": 1})
+                                result["method"] = "cdp"
+                                result["x"], result["y"] = pos["x"], pos["y"]
+                    except ImportError:
+                        pass
+                elif action == "fill" and selector and value:
+                    js = """(function(){
+                        var el = document.querySelector(SEL);
+                        if (!el) return {error: 'not found'};
+                        el.focus();
+                        var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set
+                            || Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
+                        if (setter) setter.call(el, VAL);
+                        el.dispatchEvent(new Event('input', {bubbles: true}));
+                        el.dispatchEvent(new Event('change', {bubbles: true}));
+                        return {filled: true};
+                    })()""".replace("SEL", json.dumps(selector)).replace("VAL", json.dumps(value))
+                    cdp_send("Runtime.evaluate", {"expression": js, "returnByValue": True})
+                    result["method"] = "cdp"
+                elif action == "screenshot":
+                    pass  # Just take screenshot below
+                elif action == "wait":
+                    time.sleep(float(value or 1))
+                    result["waited"] = float(value or 1)
+            except Exception as e:
+                result["status"] = "failed"
+                result["error"] = str(e)
+
+            # Wait and take verification screenshot
+            time.sleep(wait_ms / 1000)
+
+            if do_ocr:
+                ss = native_ocr()
+            else:
+                ss = native_screenshot()
+
+            result["screenshot"] = ss
+            result["elapsed"] = round(time.time() - result["started_at"], 2)
+            del result["started_at"]
+            return result
+
+    server = HTTPServer((host, port), CUHandler)
+    print(f"Listening on http://{host}:{port}", file=sys.stderr)
+    print(f"Try: curl http://{host}:{port}/health", file=sys.stderr)
+    print(file=sys.stderr)
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nShutting down...", file=sys.stderr)
+        server.shutdown()
+
+
+# ── Main ──────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="computer-use — Universal Desktop + Browser Automation",
+        formatter_class=argparse.RawTextHelpFormatter
+    )
+    parser.add_argument("--json", action="store_true", default=True,
+                       help="Output JSON (default: always on)")
+
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    # Native operations
+    p = sub.add_parser("screenshot", help="Take screenshot")
+    p.add_argument("--ocr", action="store_true", help="Run OCR on screenshot")
+    p.set_defaults(func=run_screenshot)
+
+    p = sub.add_parser("ocr", help="Run OCR on an image")
+    p.add_argument("image", nargs="?", default=None, help="Path to image (or latest screenshot)")
+    p.set_defaults(func=run_ocr)
+
+    p = sub.add_parser("tree", help="Get AX tree of frontmost app")
+    p.set_defaults(func=run_tree)
+
+    p = sub.add_parser("click", help="Physical mouse click")
+    p.add_argument("x", type=int)
+    p.add_argument("y", type=int)
+    p.set_defaults(func=run_click)
+
+    p = sub.add_parser("type", help="Type text at current focus")
+    p.add_argument("text", help="Text to type")
+    p.set_defaults(func=run_type)
+
+    p = sub.add_parser("key", help="Press key shortcut")
+    p.add_argument("shortcut", help='e.g. "cmd+r", "cmd+shift+o"')
+    p.set_defaults(func=run_key)
+
+    p = sub.add_parser("scroll", help="Scroll at current position")
+    p.add_argument("dx", type=int, nargs="?", default=0)
+    p.add_argument("dy", type=int, nargs="?", default=3)
+    p.set_defaults(func=run_scroll)
+
+    p = sub.add_parser("mouse", help="Move mouse")
+    p.add_argument("x", type=int)
+    p.add_argument("y", type=int)
+    p.set_defaults(func=run_mouse)
+
+    p = sub.add_parser("position", help="Get mouse position")
+    p.set_defaults(func=run_position)
+
+    # CDP operations
+    p = sub.add_parser("cdp-click", help="Browser click via CDP")
+    p.add_argument("x", type=int, nargs="?", help="X coordinate (omit if using --selector)")
+    p.add_argument("y", type=int, nargs="?", help="Y coordinate")
+    p.add_argument("--selector", "-s", help="CSS selector to click")
+    p.set_defaults(func=run_cdp_click)
+
+    p = sub.add_parser("cdp-type", help="Browser fill input via CDP")
+    p.add_argument("selector", help="CSS selector")
+    p.add_argument("text", help="Text to fill")
+    p.set_defaults(func=run_cdp_type)
+
+    p = sub.add_parser("cdp-eval", help="Browser evaluate JS via CDP")
+    p.add_argument("expression", help="JavaScript expression")
+    p.set_defaults(func=run_cdp_eval)
+
+    p = sub.add_parser("cdp-interactive", help="List interactive elements via CDP")
+    p.set_defaults(func=run_cdp_interactive)
+
+    p = sub.add_parser("cdp-screenshot", help="Browser screenshot via CDP")
+    p.set_defaults(func=run_cdp_screenshot)
+
+    p = sub.add_parser("cdp-file", help="Browser file input via CDP")
+    p.add_argument("selector")
+    p.add_argument("path")
+    p.set_defaults(func=run_cdp_file)
+
+    p = sub.add_parser("cdp-tabs", help="List Chrome tabs via CDP")
+    p.add_argument("--verbose", "-v", action="store_true")
+    p.set_defaults(func=run_cdp_tabs)
+
+    p = sub.add_parser("step", help="Execute action → screenshot (for agent loop)")
+    p.add_argument("description", help="What this step does (for logging)")
+    p.add_argument("--action", "-a", choices=["click", "fill", "screenshot", "wait"], default="click",
+                   help="Action to perform")
+    p.add_argument("--selector", "-s", help="CSS selector for the target element")
+    p.add_argument("--value", "-v", help="Value for fill action")
+    p.add_argument("--wait", "-w", help="Wait ms after action before screenshot")
+    p.add_argument("--ocr", action="store_true", help="Run OCR on verification screenshot")
+    p.set_defaults(func=run_step)
+
+    # Setup
+    p = sub.add_parser("start-chrome", help="Launch Chrome with remote debugging port")
+    p.add_argument("--port", type=int, default=CDP_PORT)
+    p.set_defaults(func=run_start_chrome)
+
+    # Server mode
+    p = sub.add_parser("serve", help="Start HTTP server for agent integration")
+    p.add_argument("--port", type=int, default=9090)
+    p.add_argument("--host", default="127.0.0.1")
+    p.set_defaults(func=run_serve)
+
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

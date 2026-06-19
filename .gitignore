@@ -1,0 +1,15 @@
+# Compiled artifacts
+native-host/ocr
+
+# macOS
+.DS_Store
+
+# Node modules (if any)
+node_modules/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Screenshots (generated at runtime)
+.DS_Store

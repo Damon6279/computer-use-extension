@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Computer Use</title>
+  <link rel="stylesheet" href="sidepanel.css">
+</head>
+<body>
+  <div id="app">
+    <header>
+      <h1>Computer Use</h1>
+      <div id="status-bar">
+        <span id="status-dot" class="dot gray"></span>
+        <span id="status-text">Not connected</span>
+        <button id="reconnect-btn" style="margin-left:8px;padding:2px 8px;font-size:11px;border:1px solid #0f3460;background:#16213e;color:#eee;border-radius:3px;cursor:pointer;">Reconnect</button>
+        <button id="ping-btn" style="padding:2px 8px;font-size:11px;border:1px solid #0f3460;background:#16213e;color:#eee;border-radius:3px;cursor:pointer;">Ping</button>
+      </div>
+    </header>
+
+    <nav id="mode-tabs">
+      <button class="tab active" data-mode="guided">Guided</button>
+      <button class="tab" data-mode="record">Record</button>
+      <button class="tab" data-mode="replay">Replay</button>
+    </nav>
+
+    <section id="guided-mode" class="mode-panel active">
+      <div id="screenshot-area">
+        <img id="screenshot-img" src="" alt="Screenshot will appear here">
+        <span id="no-screenshot">No screenshot yet</span>
+      </div>
+
+      <div id="action-log">
+        <h3>Action Log</h3>
+        <div id="log-entries"></div>
+      </div>
+
+      <div id="input-area">
+        <textarea id="instruction-input" placeholder="Type a command or paste instructions...&#10;&#10;Example:&#10;Click the Add Attachment button&#10;Fill summary with Visitor control&#10;Select Minor from Severity dropdown" rows="4"></textarea>
+        <div id="input-actions">
+          <select id="action-type">
+            <option value="click">Click</option>
+            <option value="fill">Fill</option>
+            <option value="select">Select</option>
+            <option value="scroll">Scroll</option>
+            <option value="wait">Wait</option>
+            <option value="screenshot">Screenshot</option>
+            <option value="find">Find</option>
+          </select>
+          <input id="selector-input" placeholder="CSS selector or text" />
+          <input id="value-input" placeholder="Value (for fill/select)" />
+          <button id="execute-btn">Execute</button>
+        </div>
+      </div>
+
+      <div id="speed-control">
+        <label>Delay: <input type="range" id="speed-slider" min="100" max="3000" value="600" step="100"></label>
+        <span id="speed-value">600ms</span>
+      </div>
+    </section>
+
+    <section id="record-mode" class="mode-panel">
+      <p>Click "Start Recording", then perform actions on the page. Clicks, inputs, and scrolls will be captured.</p>
+      <button id="record-btn">Start Recording</button>
+      <button id="stop-record-btn" disabled>Stop Recording</button>
+      <div id="recorded-actions"></div>
+    </section>
+
+    <section id="replay-mode" class="mode-panel">
+      <p>Load a recorded macro and replay it with the virtual cursor visible.</p>
+      <button id="replay-btn">Load & Replay</button>
+    </section>
+  </div>
+
+  <script src="sidepanel.js"></script>
+</body>
+</html>
