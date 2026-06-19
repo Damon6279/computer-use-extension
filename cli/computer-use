@@ -13,8 +13,10 @@ Two channels:
     or WebSocket remote debugging port — works on browser content.
 
 Usage:
-  computer-use screenshot                    Take screenshot, return path
-  computer-use screenshot --ocr              Take screenshot + OCR text
+  computer-use screenshot                    Full-screen screenshot
+  computer-use screenshot --ocr              Full-screen screenshot + OCR
+  computer-use screenshot --window "App"     Capture a specific window
+  computer-use screenshot --window "App" --ocr  Window screenshot + OCR
   computer-use ocr <image_path>              Run Apple Vision OCR on image
   computer-use tree                          Get AX tree of frontmost app
   computer-use click <x> <y>                 Physical click at screen coords
@@ -24,6 +26,7 @@ Usage:
   computer-use mouse <x> <y>                 Move mouse to screen coords
   computer-use position                      Get current mouse position
 
+  computer-use chrome-js <expr>              Execute JS via CDP (no hang)
   computer-use cdp-click <selector>          Browser click by CSS selector
   computer-use cdp-type <selector> <text>     Browser fill input
   computer-use cdp-screenshot                Browser page screenshot (base64)
@@ -70,22 +73,54 @@ CDP_PORT = int(os.environ.get("CU_CDP_PORT", "9222"))
 
 # ── Native Operations ─────────────────────────────────────────────
 
-def native_screenshot():
-    """Take a full-screen screenshot via screencapture."""
+def native_screenshot(window_name=None):
+    """Take a screenshot via screencapture.
+
+    Args:
+        window_name: If given, capture only this app's window (e.g. "Google Chrome").
+                     If None, capture full screen.
+
+    Window capture uses bounds-based approach: gets the window position/size
+    via AppleScript, then captures that screen region with -R.
+    This avoids needing CGWindowIDs (which require PyObjC or Swift to resolve).
+    """
     ts = int(time.time() * 1000)
     path = str(SCREENSHOT_DIR / f"cu_{ts}.png")
-    subprocess.run(["screencapture", "-x", path], timeout=10, capture_output=True)
+
+    if window_name:
+        # Get window bounds: left, top, right, bottom
+        script = f'tell app "{window_name}" to get bounds of window 1'
+        r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=5)
+        if r.returncode != 0 or not r.stdout.strip():
+            return {"status": "failed", "error": f"No window found for app: {window_name}"}
+        parts = [int(x.strip()) for x in r.stdout.strip().split(",")]
+        if len(parts) != 4:
+            return {"status": "failed", "error": f"Unexpected bounds format: {r.stdout.strip()}"}
+        left, top, right, bottom = parts
+        w, h = right - left, bottom - top
+        subprocess.run(
+            ["screencapture", "-R", f"{left},{top},{w},{h}", path],
+            timeout=10, capture_output=True
+        )
+    else:
+        subprocess.run(["screencapture", "-x", path], timeout=10, capture_output=True)
+
     if not os.path.exists(path):
         return {"status": "failed", "error": "screencapture failed"}
-    return {"status": "ok", "path": path}
+    return {"status": "ok", "path": path, "window": window_name or "fullscreen"}
 
 
-def native_ocr(image_path=None):
-    """Run Apple Vision OCR on an image. Takes screenshot if no path given."""
+def native_ocr(image_path=None, window_name=None):
+    """Run Apple Vision OCR on an image. Takes screenshot if no path given.
+
+    Args:
+        image_path: Path to an existing image, or None to take a screenshot first.
+        window_name: If taking a screenshot, app window to capture (None = full screen).
+    """
     if image_path:
         path = image_path
     else:
-        result = native_screenshot()
+        result = native_screenshot(window_name)
         if result["status"] != "ok":
             return result
         path = result["path"]
@@ -110,7 +145,8 @@ def native_ocr(image_path=None):
             "path": path,
             "imageWidth": iw,
             "imageHeight": ih,
-            "blocks": data["blocks"]
+            "blocks": data["blocks"],
+            "window": window_name or "fullscreen"
         }
     except json.JSONDecodeError as e:
         return {"status": "failed", "error": f"JSON parse: {e}"}
@@ -259,7 +295,7 @@ def cdp_discover_tabs():
         url = f"http://localhost:{CDP_PORT}/json"
         req = urllib.request.urlopen(url, timeout=3)
         return json.loads(req.read().decode())
-    except (urllib.error.URLError, ConnectionRefusedError, json.JSONDecodeError) as e:
+    except (urllib.error.URLError, ConnectionRefusedError, socket.timeout, json.JSONDecodeError) as e:
         return None
 
 
@@ -337,6 +373,80 @@ def cdp_process_tabs(verbose=False):
     return {"status": "ok", "tabs": result, "count": len(result)}
 
 
+def _osa_exec_js(js_code, timeout=15):
+    """Execute JavaScript in Chrome via AppleScript, with timeout handling.
+
+    AppleScript's execute javascript blocks when the page is stuck (Pace.js spinner,
+    AJAX loading, mid-navigation). This handles that by catching TimeoutExpired,
+    reloading the tab, and retrying once.
+    """
+    b64 = base64.b64encode(js_code.encode()).decode()
+    as_src = (
+        'tell application "Google Chrome"\n'
+        'set js to do shell script "echo {b64} | base64 -d"\n'
+        'set result to execute active tab of window 1 javascript js\n'
+        'return result\n'
+        'end tell'
+    )
+
+    try:
+        proc = subprocess.run(['osascript', '-e', as_src], capture_output=True, text=True, timeout=timeout)
+        if proc.returncode != 0:
+            return {"status": "failed", "error": proc.stderr.strip() or proc.stdout.strip()}
+        return {"status": "ok", "result": {"value": proc.stdout.strip()}}
+    except subprocess.TimeoutExpired:
+        # Page is stuck — reload and retry once
+        subprocess.run(
+            ['osascript', '-e', 'tell app "Google Chrome" to reload active tab of window 1'],
+            timeout=5, capture_output=True
+        )
+        time.sleep(5)
+        try:
+            proc = subprocess.run(['osascript', '-e', as_src], capture_output=True, text=True, timeout=timeout)
+            if proc.returncode == 0:
+                return {"status": "ok", "result": {"value": proc.stdout.strip()}}
+            return {"status": "failed", "error": proc.stderr.strip()}
+        except subprocess.TimeoutExpired:
+            return {"status": "failed", "error": "AppleScript timeout after reload — page still stuck"}
+
+
+def chrome_js(expression, timeout_sec=10, return_by_value=True, await_promise=False, native_fallback=True):
+    """Execute JavaScript in Chrome via CDP, with AppleScript fallback.
+
+    Tries CDP WebSocket first (configurable timeout, no hanging).
+    If CDP is not available, falls back to AppleScript with auto-reload recovery.
+    """
+    params = {
+        "expression": expression,
+        "returnByValue": return_by_value,
+    }
+    if await_promise:
+        params["awaitPromise"] = True
+        params["timeout"] = int(timeout_sec * 1000)
+
+    # Try CDP first
+    tabs = cdp_discover_tabs()
+    if tabs:
+        result = cdp_send("Runtime.evaluate", params, timeout_sec=timeout_sec)
+        if result.get("status") == "ok" and return_by_value:
+            value = result.get("result", {}).get("result", {}).get("value")
+            result["value"] = value
+        result["method"] = "cdp"
+        return result
+
+    # CDP not available
+    if not native_fallback:
+        return {"status": "failed", "error": "Chrome CDP not available (need --remote-debugging-port=9222)",
+                "method": "none"}
+
+    # Fall back to AppleScript
+    result = _osa_exec_js(expression, timeout=timeout_sec)
+    if result.get("status") == "ok" and return_by_value:
+        result["value"] = result.get("result", {}).get("value")
+    result["method"] = "applescript"
+    return result
+
+
 # ── Utility ───────────────────────────────────────────────────────
 
 def json_output(data):
@@ -348,11 +458,12 @@ def json_output(data):
 # ── Modes ─────────────────────────────────────────────────────────
 
 def run_screenshot(args):
+    window = getattr(args, "window", None)
     if args.ocr:
-        result = native_ocr()
+        result = native_ocr(window_name=window)
         json_output(result)
     else:
-        result = native_screenshot()
+        result = native_screenshot(window)
         json_output(result)
 
 
@@ -568,6 +679,17 @@ def run_cdp_file(args):
 
 def run_cdp_tabs(args):
     result = cdp_process_tabs(args.verbose)
+    json_output(result)
+
+
+def run_chrome_js(args):
+    """Execute JS in Chrome via CDP WebSocket — no hanging on stuck pages."""
+    result = chrome_js(
+        expression=args.expression,
+        timeout_sec=args.timeout,
+        return_by_value=not args.no_return,
+        await_promise=args.await_promise,
+    )
     json_output(result)
 
 
@@ -870,8 +992,9 @@ def main():
     sub = parser.add_subparsers(dest="command", required=True)
 
     # Native operations
-    p = sub.add_parser("screenshot", help="Take screenshot")
-    p.add_argument("--ocr", action="store_true", help="Run OCR on screenshot")
+    p = sub.add_parser("screenshot", help="Take screenshot (full-screen or by window)")
+    p.add_argument("--ocr", action="store_true", help="Run Apple Vision OCR on the screenshot")
+    p.add_argument("--window", "-w", help='Window to capture by app name, e.g. "Google Chrome"')
     p.set_defaults(func=run_screenshot)
 
     p = sub.add_parser("ocr", help="Run OCR on an image")
@@ -937,6 +1060,16 @@ def main():
     p = sub.add_parser("cdp-tabs", help="List Chrome tabs via CDP")
     p.add_argument("--verbose", "-v", action="store_true")
     p.set_defaults(func=run_cdp_tabs)
+
+    # Chrome JS execution (CDP-based, no AppleScript hanging)
+    p = sub.add_parser("chrome-js", help="Execute JS in Chrome via CDP (no hanging)")
+    p.add_argument("expression", help="JavaScript expression to evaluate")
+    p.add_argument("--timeout", type=int, default=10, help="CDP response timeout in seconds")
+    p.add_argument("--no-return", dest="no_return", action="store_true",
+                   help="Don't return result value (faster)")
+    p.add_argument("--await", dest="await_promise", action="store_true",
+                   help="Wait for Promise to resolve")
+    p.set_defaults(func=run_chrome_js)
 
     p = sub.add_parser("step", help="Execute action → screenshot (for agent loop)")
     p.add_argument("description", help="What this step does (for logging)")

@@ -70,25 +70,72 @@ def run_osa(script, timeout=10):
 
 # ── Message Handlers ──────────────────────────────────────────────
 
-def handle_screenshot(msg):
-    path = os.path.expanduser("~/.cache/mac-use-screenshots")
-    os.makedirs(path, exist_ok=True)
-    ts = int(time.time() * 1000)
-    out = f"{path}/cu_screenshot_{ts}.png"
+SCREENSHOT_DIR = os.path.expanduser("~/.cache/mac-use-screenshots")
+
+
+def _screencapture_full(out):
+    """Full-screen screenshot."""
     subprocess.run(["screencapture", "-x", out], timeout=10, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return {"type": "screenshot_response", "path": out, "status": "ok"}
+
+
+def _screencapture_window(app_name, out):
+    """Capture a specific app window by name using bounds-based approach.
+
+    Gets the app window's bounds via AppleScript, then captures that
+    screen region with screencapture -R. This avoids needing CGWindowIDs
+    (which require PyObjC or Swift to resolve).
+    """
+    r = subprocess.run(
+        ["osascript", "-e", f'tell app "{app_name}" to get bounds of window 1'],
+        capture_output=True, text=True, timeout=5
+    )
+    if r.returncode != 0 or not r.stdout.strip():
+        return False
+    parts = [int(x.strip()) for x in r.stdout.strip().split(",")]
+    if len(parts) != 4:
+        return False
+    left, top, right, bottom = parts
+    w, h = right - left, bottom - top
+    subprocess.run(
+        ["screencapture", "-R", f"{left},{top},{w},{h}", out],
+        timeout=10, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+    return True
+
+
+def _take_screenshot(msg):
+    """Take a screenshot (full-screen or window). Returns path or None."""
+    app = msg.get("app", "")
+    os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+    ts = int(time.time() * 1000)
+    prefix = msg.get("type", "").replace("ocr_", "").replace("screenshot", "ss")
+    out = f"{SCREENSHOT_DIR}/cu_{prefix}_{ts}.png"
+
+    if app:
+        ok = _screencapture_window(app, out)
+        if not ok:
+            return None
+    else:
+        _screencapture_full(out)
+
+    return out if os.path.exists(out) else None
+
+
+def handle_screenshot(msg):
+    out = _take_screenshot(msg)
+    if out is None:
+        return {"type": "screenshot_response", "status": "failed", "error": "screencapture failed"}
+    return {"type": "screenshot_response", "path": out, "status": "ok", "app": msg.get("app", "fullscreen")}
 
 
 def handle_ocr_screenshot(msg):
     """Run Apple Vision OCR on a screenshot (or specified image path)."""
     path = msg.get("path", "")
     if not path:
-        # Take a fresh screenshot
-        path = os.path.expanduser("~/.cache/mac-use-screenshots")
-        os.makedirs(path, exist_ok=True)
-        ts = int(time.time() * 1000)
-        path = f"{path}/cu_ocr_{ts}.png"
-        subprocess.run(["screencapture", "-x", path], timeout=10, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+        path = _take_screenshot(msg)
+        if path is None:
+            return {"type": "ocr_response", "status": "failed", "error": "screencapture failed"}
 
     if not os.path.exists(path):
         return {"type": "ocr_response", "status": "failed", "error": f"Image not found: {path}"}
