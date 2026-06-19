@@ -75,7 +75,7 @@ def handle_screenshot(msg):
     os.makedirs(path, exist_ok=True)
     ts = int(time.time() * 1000)
     out = f"{path}/cu_screenshot_{ts}.png"
-    subprocess.run(["screencapture", "-x", out], timeout=10)
+    subprocess.run(["screencapture", "-x", out], timeout=10, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return {"type": "screenshot_response", "path": out, "status": "ok"}
 
 
@@ -88,7 +88,7 @@ def handle_ocr_screenshot(msg):
         os.makedirs(path, exist_ok=True)
         ts = int(time.time() * 1000)
         path = f"{path}/cu_ocr_{ts}.png"
-        subprocess.run(["screencapture", "-x", path], timeout=10)
+        subprocess.run(["screencapture", "-x", path], timeout=10, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     if not os.path.exists(path):
         return {"type": "ocr_response", "status": "failed", "error": f"Image not found: {path}"}
@@ -187,19 +187,19 @@ end tell
 
 def handle_mouse_move(msg):
     x, y = msg["x"], msg["y"]
-    subprocess.run([CLICKLICK, f"m:{x},{y}"], timeout=5)
+    subprocess.run([CLICKLICK, f"m:{x},{y}"], timeout=5, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return {"type": "mouse_move_response", "x": x, "y": y, "status": "ok"}
 
 
 def handle_mouse_click(msg):
     x, y = msg["x"], msg["y"]
-    subprocess.run([CLICKLICK, f"c:{x},{y}"], timeout=5)
+    subprocess.run([CLICKLICK, f"c:{x},{y}"], timeout=5, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return {"type": "mouse_click_response", "x": x, "y": y, "status": "ok"}
 
 
 def handle_mouse_double_click(msg):
     x, y = msg["x"], msg["y"]
-    subprocess.run([CLICKLICK, f"dc:{x},{y}"], timeout=5)
+    subprocess.run([CLICKLICK, f"dc:{x},{y}"], timeout=5, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return {"type": "mouse_double_click_response", "x": x, "y": y, "status": "ok"}
 
 
@@ -210,7 +210,7 @@ def handle_mouse_scroll(msg):
     args = [f"w:{delta}"]
     if x is not None and y is not None:
         args = [f"w:{delta}", f"{x},{y}"]
-    subprocess.run([CLICKLICK] + args, timeout=5)
+    subprocess.run([CLICKLICK] + args, timeout=5, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return {"type": "mouse_scroll_response", "delta": delta, "status": "ok"}
 
 
