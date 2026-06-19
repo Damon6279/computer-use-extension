@@ -21,6 +21,7 @@
     {
       "matches": ["<all_urls>"],
       "js": [
+        "lib/html2canvas.min.js",
         "content/virtual-cursor.js",
         "content/dom-actions.js",
         "content/screenshot.js",

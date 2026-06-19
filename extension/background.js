@@ -283,6 +283,12 @@ function connectNative() {
     nativePort.onDisconnect.addListener(() => {
       console.log('[ComputerUse] Native host disconnected');
       nativePort = null;
+      // Reject all pending callbacks so nothing hangs forever
+      const err = { type: 'error', message: 'Native host disconnected', status: 'failed' };
+      for (const [id, cb] of pendingCallbacks) {
+        pendingCallbacks.delete(id);
+        cb(err);
+      }
     });
 
     const id = 'init_ping';
@@ -298,15 +304,28 @@ function connectNative() {
   }
 }
 
-function sendNative(msg) {
+function sendNative(msg, timeoutMs = 10000) {
   return new Promise((resolve) => {
     if (!nativePort) connectNative();
     const id = `n${++msgId}`;
     msg.id = id;
     pendingCallbacks.set(id, resolve);
+    // Timeout guard so a dead native host doesn't hang forever
+    const timer = setTimeout(() => {
+      if (pendingCallbacks.has(id)) {
+        pendingCallbacks.delete(id);
+        resolve({ id, type: 'error', message: 'Native host timeout', status: 'failed' });
+      }
+    }, timeoutMs);
+    // Wrap so the cleanup also clears the timer
+    pendingCallbacks.set(id, (resp) => {
+      clearTimeout(timer);
+      resolve(resp);
+    });
     try {
       nativePort.postMessage(msg);
     } catch (e) {
+      clearTimeout(timer);
       pendingCallbacks.delete(id);
       resolve({ id, type: 'error', message: e.message, status: 'failed' });
     }

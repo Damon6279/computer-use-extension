@@ -540,10 +540,30 @@ def run_cdp_screenshot(args):
 
 
 def run_cdp_file(args):
-    result = cdp_send("DOM.setFileInputFiles", {
-        "files": [args.path]
-    })
-    json_output(result)
+    """Set file input using CDP with proper nodeId resolution."""
+    selector = args.selector
+    file_path = args.path
+
+    # Step 1: Get document root
+    doc = cdp_send("DOM.getDocument")
+    if doc["status"] != "ok":
+        json_output(doc)
+        return
+    doc_node_id = doc["result"]["root"]["nodeId"]
+
+    # Step 2: Query for the file input
+    q = cdp_send("DOM.querySelector", {"nodeId": doc_node_id, "selector": selector})
+    if q["status"] != "ok":
+        json_output(q)
+        return
+    node_id = q["result"]["nodeId"]
+    if not node_id or node_id == 0:
+        json_output({"status": "failed", "error": f"Element not found: {selector}"})
+        return
+
+    # Step 3: Set the files
+    r = cdp_send("DOM.setFileInputFiles", {"nodeId": node_id, "files": [file_path]})
+    json_output(r)
 
 
 def run_cdp_tabs(args):
@@ -639,53 +659,76 @@ def run_serve(args):
     """Start HTTP server for agent integration."""
     port = args.port or 9090
     host = args.host or "127.0.0.1"
+    token = args.token or os.environ.get("CU_TOKEN") or ""
+
+    if not token:
+        print("WARNING: No --token set. All requests accepted.", file=sys.stderr)
+        print("  Set CU_TOKEN env var or --token <value> for security.", file=sys.stderr)
 
     print(json.dumps({
         "status": "ok",
-        "message": f"Server starting on {host}:{port}",
+        "message": f"Server starting on {host}:{port}" + (" (authenticated)" if token else " (no auth)"),
         "endpoints": {
             "POST /execute": "Run a command (same as CLI args, in JSON body)",
-            "GET /health": "Health check",
+            "GET /health": "Health check (no auth)",
             "POST /step": "Execute step → screenshot → return result+ocr"
         }
     }), file=sys.stderr)
 
-    # Start the server
     from http.server import HTTPServer, BaseHTTPRequestHandler
-    import urllib.parse
 
     class CUHandler(BaseHTTPRequestHandler):
         def log_message(self, format, *args):
-            pass  # Quiet
+            pass
 
         def _send_json(self, data, status=200):
             body = json.dumps(data, ensure_ascii=False).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
-            self.send_header("Access-Control-Allow-Origin", "*")
+            # Restrict CORS to loopback
+            origin = self.headers.get("Origin", "")
+            allowed = any(origin.startswith(p) for p in [
+                "http://127.0.0.1:", "http://localhost:",
+                "chrome-extension://"
+            ])
+            if allowed or not origin:
+                self.send_header("Access-Control-Allow-Origin", origin or "*")
+                self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+                self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
             self.end_headers()
             self.wfile.write(body)
+
+        def _check_auth(self):
+            if not token:
+                return True
+            if self.headers.get("Authorization", "") == f"Bearer {token}":
+                return True
+            self._send_json({"status": "failed", "error": "Unauthorized"}, 401)
+            return False
+
+        def do_OPTIONS(self):
+            self._send_json({"status": "ok"})
 
         def do_GET(self):
             if self.path == "/health":
                 self._send_json({"status": "ok", "service": "computer-use", "version": "1.0.0"})
             elif self.path == "/status":
-                # Check what's available
-                cliclick_ok = shutil.which("cliclick") is not None
-                ocr_ok = os.path.exists(OCR_BIN)
-                chrome_cdp = cdp_discover_tabs()
+                if not self._check_auth():
+                    return
                 self._send_json({
                     "status": "ok",
-                    "cliclick": cliclick_ok,
-                    "ocr": ocr_ok,
-                    "chrome_cdp": isinstance(chrome_cdp, list) and len(chrome_cdp) > 0,
+                    "cliclick": shutil.which("cliclick") is not None,
+                    "ocr": os.path.exists(OCR_BIN),
+                    "chrome_cdp": isinstance(cdp_discover_tabs(), list),
                     "cdp_port": CDP_PORT,
                 })
             else:
                 self._send_json({"status": "failed", "error": "Not found"}, 404)
 
         def do_POST(self):
+            if not self._check_auth():
+                return
             try:
                 length = int(self.headers.get("Content-Length", 0))
                 body = self.rfile.read(length).decode("utf-8") if length else "{}"
@@ -695,11 +738,9 @@ def run_serve(args):
                 return
 
             if self.path == "/execute":
-                result = self._handle_execute(data)
-                self._send_json(result)
+                self._send_json(self._handle_execute(data))
             elif self.path == "/step":
-                result = self._handle_step(data)
-                self._send_json(result)
+                self._send_json(self._handle_step(data))
             else:
                 self._send_json({"status": "failed", "error": "Not found"}, 404)
 
@@ -707,9 +748,7 @@ def run_serve(args):
             """Execute a command. data: {command, args...}"""
             cmd = data.get("command", "")
             if cmd == "screenshot":
-                if data.get("ocr"):
-                    return native_ocr()
-                return native_screenshot()
+                return native_ocr() if data.get("ocr") else native_screenshot()
             elif cmd == "ocr":
                 return native_ocr(data.get("path"))
             elif cmd == "tree":
@@ -728,6 +767,18 @@ def run_serve(args):
                 return native_mouse_move(data.get("x"), data.get("y"))
             elif cmd == "cdp-tabs":
                 return cdp_process_tabs()
+            elif cmd == "cdp-file":
+                selector = data.get("selector", "")
+                filepath = data.get("path", "")
+                if not selector or not filepath:
+                    return {"status": "failed", "error": "selector and path required"}
+                doc = cdp_send("DOM.getDocument")
+                if doc["status"] != "ok":
+                    return doc
+                q = cdp_send("DOM.querySelector", {"nodeId": doc["result"]["root"]["nodeId"], "selector": selector})
+                if q["status"] != "ok" or not q["result"].get("nodeId"):
+                    return {"status": "failed", "error": f"Element not found: {selector}"}
+                return cdp_send("DOM.setFileInputFiles", {"nodeId": q["result"]["nodeId"], "files": [filepath]})
             elif cmd == "cdp-eval":
                 return cdp_send("Runtime.evaluate", {"expression": data.get("expression", ""), "returnByValue": True})
             else:
@@ -740,29 +791,25 @@ def run_serve(args):
             value = data.get("value")
             wait_ms = int(data.get("wait", 800))
             do_ocr = data.get("ocr", True)
-
             result = {"action": action, "status": "ok", "started_at": time.time()}
 
             try:
                 if action == "click" and selector:
-                    # Try CDP if available
                     try:
                         import websocket  # noqa: F401
-                        # Click via CDP evaluate + dispatch
                         js = """(function(){
                             var el = document.querySelector(SEL);
                             if (!el) return {error: 'not found'};
                             var r = el.getBoundingClientRect();
                             return {x: Math.round(r.x + r.width/2), y: Math.round(r.y + r.height/2)};
                         })()""".replace("SEL", json.dumps(selector))
-                        pos_r = cdp_send("Runtime.evaluate", {"expression": js, "returnByValue": True})
-                        if pos_r.get("status") == "ok":
-                            pos = pos_r["result"].get("result", {}).get("value", {})
+                        pr = cdp_send("Runtime.evaluate", {"expression": js, "returnByValue": True})
+                        if pr.get("status") == "ok":
+                            pos = pr["result"].get("result", {}).get("value", {})
                             if pos.get("x"):
                                 cdp_send("Input.dispatchMouseEvent", {"type": "mousePressed", "x": pos["x"], "y": pos["y"], "button": "left", "clickCount": 1})
                                 cdp_send("Input.dispatchMouseEvent", {"type": "mouseReleased", "x": pos["x"], "y": pos["y"], "button": "left", "clickCount": 1})
-                                result["method"] = "cdp"
-                                result["x"], result["y"] = pos["x"], pos["y"]
+                                result.update(method="cdp", x=pos["x"], y=pos["y"])
                     except ImportError:
                         pass
                 elif action == "fill" and selector and value:
@@ -779,23 +826,14 @@ def run_serve(args):
                     })()""".replace("SEL", json.dumps(selector)).replace("VAL", json.dumps(value))
                     cdp_send("Runtime.evaluate", {"expression": js, "returnByValue": True})
                     result["method"] = "cdp"
-                elif action == "screenshot":
-                    pass  # Just take screenshot below
                 elif action == "wait":
                     time.sleep(float(value or 1))
                     result["waited"] = float(value or 1)
             except Exception as e:
-                result["status"] = "failed"
-                result["error"] = str(e)
+                result.update(status="failed", error=str(e))
 
-            # Wait and take verification screenshot
             time.sleep(wait_ms / 1000)
-
-            if do_ocr:
-                ss = native_ocr()
-            else:
-                ss = native_screenshot()
-
+            ss = native_ocr() if do_ocr else native_screenshot()
             result["screenshot"] = ss
             result["elapsed"] = round(time.time() - result["started_at"], 2)
             del result["started_at"]
@@ -913,6 +951,7 @@ def main():
     p = sub.add_parser("serve", help="Start HTTP server for agent integration")
     p.add_argument("--port", type=int, default=9090)
     p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--token", help="Bearer token for API auth (or set CU_TOKEN env)")
     p.set_defaults(func=run_serve)
 
     args = parser.parse_args()

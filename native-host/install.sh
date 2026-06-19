@@ -68,6 +68,13 @@ fi
 
 echo ""
 echo "Testing native bridge..."
-echo '{"id":"test1","type":"ping"}' | python3 "${BRIDGE_PATH}" 2>/dev/null || true
+python3 -c "
+import struct, json, sys
+# Native messaging protocol: 4-byte uint32 length prefix + JSON
+msg = json.dumps({'id': 'test1', 'type': 'ping'}).encode('utf-8')
+sys.stdout.buffer.write(struct.pack('=I', len(msg)))
+sys.stdout.buffer.write(msg)
+sys.stdout.buffer.flush()
+" | python3 "${BRIDGE_PATH}" 2>/dev/null || true
 echo ""
 echo "Install complete! Restart Chrome for changes to take effect."
