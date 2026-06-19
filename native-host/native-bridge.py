@@ -187,19 +187,19 @@ end tell
 
 def handle_mouse_move(msg):
     x, y = msg["x"], msg["y"]
-    subprocess.run(["CLICKLICK", f"m:{x},{y}"], timeout=5)
+    subprocess.run([CLICKLICK, f"m:{x},{y}"], timeout=5)
     return {"type": "mouse_move_response", "x": x, "y": y, "status": "ok"}
 
 
 def handle_mouse_click(msg):
     x, y = msg["x"], msg["y"]
-    subprocess.run(["CLICKLICK", f"c:{x},{y}"], timeout=5)
+    subprocess.run([CLICKLICK, f"c:{x},{y}"], timeout=5)
     return {"type": "mouse_click_response", "x": x, "y": y, "status": "ok"}
 
 
 def handle_mouse_double_click(msg):
     x, y = msg["x"], msg["y"]
-    subprocess.run(["CLICKLICK", f"dc:{x},{y}"], timeout=5)
+    subprocess.run([CLICKLICK, f"dc:{x},{y}"], timeout=5)
     return {"type": "mouse_double_click_response", "x": x, "y": y, "status": "ok"}
 
 
@@ -210,7 +210,7 @@ def handle_mouse_scroll(msg):
     args = [f"w:{delta}"]
     if x is not None and y is not None:
         args = [f"w:{delta}", f"{x},{y}"]
-    subprocess.run(["CLICKLICK"] + args, timeout=5)
+    subprocess.run([CLICKLICK] + args, timeout=5)
     return {"type": "mouse_scroll_response", "delta": delta, "status": "ok"}
 
 
@@ -220,7 +220,7 @@ def handle_mouse_position(msg):
         pos = json.loads(stdout)
         return {"type": "mouse_position_response", "x": pos["x"], "y": pos["y"], "status": "ok"}
     except Exception:
-        out = subprocess.run(["CLICKLICK", "p"], capture_output=True, text=True, timeout=5)
+        out = subprocess.run([CLICKLICK, "p"], capture_output=True, text=True, timeout=5)
         x, y = out.stdout.strip().split(",")
         return {"type": "mouse_position_response", "x": int(x), "y": int(y), "status": "ok"}
 
@@ -361,7 +361,7 @@ def handle_app_focus(msg):
 def handle_ping(msg):
     """Health check — verify cliclick is installed and accessible."""
     try:
-        subprocess.run(["which", "CLICKLICK"], capture_output=True, check=True, timeout=5)
+        subprocess.run(["which", CLICKLICK], capture_output=True, check=True, timeout=5)
         return {"type": "pong", "CLICKLICK": True, "mac_use": os.path.exists(MAC_USE), "status": "ok"}
     except subprocess.CalledProcessError:
         return {"type": "pong", "CLICKLICK": False, "error": "cliclick not found. Install: brew install cliclick", "status": "failed"}

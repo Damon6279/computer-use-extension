@@ -659,11 +659,17 @@ def run_serve(args):
     """Start HTTP server for agent integration."""
     port = args.port or 9090
     host = args.host or "127.0.0.1"
+    no_auth = args.no_auth
     token = args.token or os.environ.get("CU_TOKEN") or ""
 
-    if not token:
-        print("WARNING: No --token set. All requests accepted.", file=sys.stderr)
-        print("  Set CU_TOKEN env var or --token <value> for security.", file=sys.stderr)
+    if not token and not no_auth:
+        print("ERROR: --token <value> or CU_TOKEN env var required for security.", file=sys.stderr)
+        print("  Use --no-auth for local-only development (not recommended).", file=sys.stderr)
+        print(json.dumps({"status": "failed", "error": "Token required, set CU_TOKEN or --token"}))
+        return
+
+    if no_auth:
+        print("WARNING: Running without authentication. Only use on localhost.", file=sys.stderr)
 
     print(json.dumps({
         "status": "ok",
@@ -952,6 +958,7 @@ def main():
     p.add_argument("--port", type=int, default=9090)
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--token", help="Bearer token for API auth (or set CU_TOKEN env)")
+    p.add_argument("--no-auth", action="store_true", help="Disable auth (dev only)")
     p.set_defaults(func=run_serve)
 
     args = parser.parse_args()
