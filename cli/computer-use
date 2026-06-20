@@ -361,59 +361,116 @@ def cdp_discover_tabs():
         return None
 
 
-def cdp_send(method, params=None, tab_id=None, timeout_sec=10):
-    """Send a CDP command via WebSocket to Chrome tab.
+def cdp_get_browser_ws():
+    """Get the browser-level WebSocket debugger URL."""
+    try:
+        version = json.loads(urllib.request.urlopen(f'http://localhost:{CDP_PORT}/json/version', timeout=3).read().decode())
+        return version.get('webSocketDebuggerUrl')
+    except Exception:
+        return None
 
-    Requires websocket-client: pip3 install websocket-client
+
+def cdp_create_tab():
+    """Create a fresh page tab and return its WebSocket URL."""
+    browser_ws = cdp_get_browser_ws()
+    if not browser_ws:
+        return None
+    try:
+        from websockets.sync.client import connect as ws_connect
+        with ws_connect(browser_ws, close_timeout=5) as bws:
+            bws.send(json.dumps({"id": 1, "method": "Target.createTarget", "params": {"url": "about:blank"}}))
+            start = time.time()
+            while time.time() - start < 5:
+                try:
+                    raw = bws.recv(timeout=1.0)
+                    resp = json.loads(raw)
+                    if resp.get("id") == 1:
+                        tid = resp["result"]["targetId"]
+                        # Wait for tab in /json
+                        for retry in range(15):
+                            try:
+                                tabs = json.loads(urllib.request.urlopen(f'http://localhost:{CDP_PORT}/json', timeout=3).read().decode())
+                                if tabs:
+                                    for t in tabs:
+                                        if t["id"] == tid:
+                                            return t["webSocketDebuggerUrl"]
+                            except Exception:
+                                pass
+                            time.sleep(0.2)
+                        return None
+                except Exception:
+                    continue
+            return None
+    except Exception:
+        return None
+
+
+def cdp_send(method, params=None, tab_id=None, timeout_sec=10):
+    """Send a CDP command via WebSocket.
+
+    Creates a fresh page target for each call to avoid stale session state.
+    Uses websockets library (pip3 install websockets).
     """
     try:
-        import websocket
+        from websockets.sync.client import connect as ws_connect
     except ImportError:
-        # Return instructions if library not available
         tabs = cdp_discover_tabs()
         if not tabs:
             return {"status": "failed", "error": f"Cannot connect to Chrome at port {CDP_PORT}"}
         return {
             "status": "failed",
-            "error": "websocket-client not installed",
-            "install": "pip3 install websocket-client",
+            "error": "websockets not installed",
+            "install": "pip3 install websockets",
             "tabCount": len(tabs)
         }
 
-    # Find the tab
-    tabs = cdp_discover_tabs()
-    if not tabs:
-        return {"status": "failed", "error": f"Cannot connect to Chrome at port {CDP_PORT}"}
+    # Get the target WebSocket URL
+    target_ws_url = None
+    if not tab_id:
+        target_ws_url = cdp_create_tab()
+    
+    if not target_ws_url:
+        # Fallback: use existing tab
+        tabs = cdp_discover_tabs()
+        if not tabs:
+            return {"status": "failed", "error": f"Cannot connect to Chrome at port {CDP_PORT}"}
+        target = None
+        for t in tabs:
+            if tab_id and t["id"] == tab_id:
+                target = t
+                break
+            if not tab_id and t.get("type") == "page" and t.get("url", "").startswith("http"):
+                target = t
+                break
+        if not target:
+            target = tabs[0]
+        target_ws_url = target["webSocketDebuggerUrl"]
 
-    target = None
-    for t in tabs:
-        if tab_id and t["id"] == tab_id:
-            target = t
-            break
-        if not tab_id and t.get("type") == "page" and t.get("url", "").startswith("http"):
-            target = t
-            break
-    if not target:
-        target = tabs[0]
-
-    ws_url = target["webSocketDebuggerUrl"]
-    msg_id = int(time.time() * 1000)
+    # Use a simple small integer id — Chrome CDP may reject very large ids
+    msg_id = hash(method) % 100000 + 1
 
     try:
-        ws = websocket.create_connection(ws_url, timeout=timeout_sec)
-        ws.send(json.dumps({"id": msg_id, "method": method, "params": params or {}}))
+        with ws_connect(target_ws_url, close_timeout=timeout_sec) as ws:
+            ws.send(json.dumps({"id": msg_id, "method": method, "params": params or {}}))
 
-        # Wait for response with matching id
-        start = time.time()
-        while time.time() - start < timeout_sec:
-            resp = json.loads(ws.recv())
-            if resp.get("id") == msg_id:
-                ws.close()
-                if "error" in resp:
-                    return {"status": "failed", "error": resp["error"].get("message", str(resp["error"]))}
-                return {"status": "ok", "result": resp.get("result")}
-        ws.close()
-        return {"status": "failed", "error": "Response timeout"}
+            # Wait for response with matching id
+            start = time.time()
+            while time.time() - start < timeout_sec:
+                remaining = timeout_sec - (time.time() - start)
+                if remaining <= 0:
+                    break
+                try:
+                    raw = ws.recv(timeout=min(1.0, remaining))
+                except Exception:
+                    continue
+                if not raw:
+                    continue
+                resp = json.loads(raw)
+                if resp.get("id") == msg_id:
+                    if "error" in resp:
+                        return {"status": "failed", "error": resp["error"].get("message", str(resp["error"]))}
+                    return {"status": "ok", "result": resp.get("result")}
+            return {"status": "failed", "error": "Response timeout"}
     except Exception as e:
         return {"status": "failed", "error": str(e)}
 
@@ -490,16 +547,18 @@ def chrome_js(expression, timeout_sec=10, return_by_value=True, await_promise=Fa
     tabs = cdp_discover_tabs()
     if tabs:
         result = cdp_send("Runtime.evaluate", params, timeout_sec=timeout_sec)
-        if result.get("status") == "ok" and return_by_value:
-            value = result.get("result", {}).get("result", {}).get("value")
-            result["value"] = value
-        result["method"] = "cdp"
-        return result
+        if result.get("status") == "ok":
+            result["method"] = "cdp"
+            if return_by_value:
+                value = result.get("result", {}).get("result", {}).get("value")
+                result["value"] = value
+            return result
+        # CDP WebSocket failed — fall back to AppleScript below
 
-    # CDP not available
+    # CDP not available or WebSocket failed
     if not native_fallback:
         return {"status": "failed", "error": "Chrome CDP not available (need --remote-debugging-port=9222)",
-                "method": "none"}
+                "method": "none", "cdp_result": result if tabs else None}
 
     # Fall back to AppleScript
     result = _osa_exec_js(expression, timeout=timeout_sec)
@@ -672,7 +731,9 @@ def run_start_chrome(args):
         subprocess.Popen([
             "open", "-a", "Google Chrome", "-n", "--args",
             f"--remote-debugging-port={port}",
+            "--remote-allow-origins=*",
             "--no-first-run",
+            "--user-data-dir=/tmp/chrome-cdp-profile",
         ])
         json_output({"status": "ok", "message": f"Chrome launched with CDP on port {port}"})
     except Exception as e:
@@ -844,14 +905,10 @@ def run_step(args):
 
     try:
         if action == "click" and selector:
-            # Try CDP first (if websocket-client available)
-            try:
-                import websocket  # noqa: F401
-                r = run_cdp_click_raw(args)
+            # Try CDP first, fallback to native click if not available
+            r = run_cdp_click_raw(args)
+            if r.get("method") == "cdp" or r.get("status") == "ok":
                 result["actions"].append({"method": "cdp", "selector": selector, "x": r.get("x"), "y": r.get("y")})
-            except ImportError:
-                # Fallback to native click: get element position first via JS eval
-                r = {"status": "failed", "error": "CDP not available"}
 
         elif action == "fill" and selector and value:
             result["actions"].append({"method": "cdp", "selector": selector})
@@ -1070,23 +1127,19 @@ def run_serve(args):
 
             try:
                 if action == "click" and selector:
-                    try:
-                        import websocket  # noqa: F401
-                        js = """(function(){
-                            var el = document.querySelector(SEL);
-                            if (!el) return {error: 'not found'};
-                            var r = el.getBoundingClientRect();
-                            return {x: Math.round(r.x + r.width/2), y: Math.round(r.y + r.height/2)};
-                        })()""".replace("SEL", json.dumps(selector))
-                        pr = cdp_send("Runtime.evaluate", {"expression": js, "returnByValue": True})
-                        if pr.get("status") == "ok":
-                            pos = pr["result"].get("result", {}).get("value", {})
-                            if pos.get("x"):
-                                cdp_send("Input.dispatchMouseEvent", {"type": "mousePressed", "x": pos["x"], "y": pos["y"], "button": "left", "clickCount": 1})
-                                cdp_send("Input.dispatchMouseEvent", {"type": "mouseReleased", "x": pos["x"], "y": pos["y"], "button": "left", "clickCount": 1})
-                                result.update(method="cdp", x=pos["x"], y=pos["y"])
-                    except ImportError:
-                        pass
+                    js = """(function(){
+                        var el = document.querySelector(SEL);
+                        if (!el) return {error: 'not found'};
+                        var r = el.getBoundingClientRect();
+                        return {x: Math.round(r.x + r.width/2), y: Math.round(r.y + r.height/2)};
+                    })()""".replace("SEL", json.dumps(selector))
+                    pr = cdp_send("Runtime.evaluate", {"expression": js, "returnByValue": True})
+                    if pr.get("status") == "ok":
+                        pos = pr["result"].get("result", {}).get("value", {})
+                        if pos.get("x"):
+                            cdp_send("Input.dispatchMouseEvent", {"type": "mousePressed", "x": pos["x"], "y": pos["y"], "button": "left", "clickCount": 1})
+                            cdp_send("Input.dispatchMouseEvent", {"type": "mouseReleased", "x": pos["x"], "y": pos["y"], "button": "left", "clickCount": 1})
+                            result.update(method="cdp", x=pos["x"], y=pos["y"])
                 elif action == "fill" and selector and value:
                     js = """(function(){
                         var el = document.querySelector(SEL);
