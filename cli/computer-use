@@ -20,11 +20,14 @@ Usage:
   computer-use ocr <image_path>              Run Apple Vision OCR on image
   computer-use tree                          Get AX tree of frontmost app
   computer-use click <x> <y>                 Physical click at screen coords
+  computer-use click --ocr <x> <y>          Click using OCR pixel coords (Retina auto-convert)
   computer-use type <text>                   Type text at current focus
   computer-use key <shortcut>                Press key combo (e.g. cmd+r)
   computer-use scroll <dx> [dy]              Scroll at current position
   computer-use mouse <x> <y>                 Move mouse to screen coords
+  computer-use mouse --ocr <x> <y>          Move mouse using OCR pixel coords
   computer-use position                      Get current mouse position
+  computer-use calibrate                     Show display scale factor + coordinate info
 
   computer-use chrome-js <expr>              Execute JS via CDP (no hang)
   computer-use cdp-click <selector>          Browser click by CSS selector
@@ -107,7 +110,8 @@ def native_screenshot(window_name=None):
 
     if not os.path.exists(path):
         return {"status": "failed", "error": "screencapture failed"}
-    return {"status": "ok", "path": path, "window": window_name or "fullscreen"}
+    scale = get_display_scale()
+    return {"status": "ok", "path": path, "window": window_name or "fullscreen", "scale": scale}
 
 
 def native_ocr(image_path=None, window_name=None):
@@ -140,11 +144,13 @@ def native_ocr(image_path=None, window_name=None):
             block["py"] = round((1 - block["y"] - block["h"]) * ih)
             block["pw"] = round(block["w"] * iw)
             block["ph"] = round(block["h"] * ih)
+        scale = get_display_scale()
         return {
             "status": "ok",
             "path": path,
             "imageWidth": iw,
             "imageHeight": ih,
+            "scale": scale,
             "blocks": data["blocks"],
             "window": window_name or "fullscreen"
         }
@@ -154,8 +160,64 @@ def native_ocr(image_path=None, window_name=None):
         return {"status": "failed", "error": str(e)}
 
 
+def get_display_scale():
+    """Get the main screen's backing scale factor (2.0 for Retina, 1.0 for standard).
+
+    Uses `system_profiler` or `screen` query to detect Retina.
+    Falls back to `defaults` or `screencapture` comparison.
+    """
+    try:
+        r = subprocess.run(
+            ["system_profiler", "SPDisplaysDataType", "-json"],
+            capture_output=True, text=True, timeout=5
+        )
+        if r.returncode == 0:
+            data = json.loads(r.stdout)
+            displays = data.get("SPDisplaysDataType", [])
+            for d in displays:
+                if d.get("spdisplays_retina") == "spdisplays_retina-yes":
+                    return 2.0
+    except Exception:
+        pass
+
+    # Fallback: compare point-based vs pixel-based screen size
+    try:
+        r = subprocess.run(
+            ["osascript", "-e", "tell app \"Finder\" to get bounds of window of desktop"],
+            capture_output=True, text=True, timeout=5
+        )
+        if r.returncode == 0:
+            parts = [int(x.strip()) for x in r.stdout.strip().split(",")]
+            pt_w = parts[2] - parts[0]
+            # screencapture on Retina gives twice the points
+            import tempfile
+            tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+            tmp.close()
+            subprocess.run(["screencapture", "-x", tmp.name], timeout=5, capture_output=True)
+            try:
+                from PIL import Image
+                px_w = Image.open(tmp.name).size[0]
+                scale = round(px_w / pt_w, 1)
+                return scale
+            except ImportError:
+                pass
+            finally:
+                os.unlink(tmp.name)
+    except Exception:
+        pass
+
+    return 1.0
+
+
+def px_to_pt(value, scale=None):
+    """Convert pixel value to point value using the display scale."""
+    if scale is None:
+        scale = get_display_scale()
+    return round(value / scale)
+
+
 def native_accessibility_tree():
-    """Get AX UI element tree of the frontmost app."""
+    """Get AX UI element tree of the frontmost app via System Events."""
     script = '''
 tell application "System Events"
     set frontApp to name of first process whose frontmost is true
@@ -169,15 +231,18 @@ tell application "System Events"
         repeat with el in allUI
             try
                 set r to role of el
-                set d to ""
-                try; set d to description of el; end try
-                set t to ""
-                try; set t to title of el; end try
+                try
+                    set d to description of el
+                end try
+                try
+                    set t to title of el
+                end try
                 set p to position of el
                 set sz to size of el
-                set output to output & r & "|" & t & "|" & d & "|" & (item 1 of p) & "," & (item 2 of p) & "," & (item 1 of sz) & "x" & (item 2 of sz) & "\\n"
-            end try
-        end repeat
+                set output to output & r & "|" & t & "|" & d & "|" & (item 1 of p) & "," & (item 2 of p) & "," & (item 1 of sz) & "x" & (item 2 of sz) & "
+"
+                end try
+            end repeat
         return output
     end tell
 end tell
@@ -478,7 +543,13 @@ def run_tree(args):
 
 
 def run_click(args):
-    result = native_mouse_click(args.x, args.y)
+    x, y = args.x, args.y
+    if getattr(args, 'ocr', False):
+        scale = get_display_scale()
+        x = px_to_pt(x, scale)
+        y = px_to_pt(y, scale)
+    result = native_mouse_click(x, y)
+    result["ocr_coords"] = {"original_x": args.x, "original_y": args.y} if getattr(args, 'ocr', False) else None
     json_output(result)
 
 
@@ -498,12 +569,71 @@ def run_scroll(args):
 
 
 def run_mouse(args):
-    result = native_mouse_move(args.x, args.y)
+    x, y = args.x, args.y
+    if getattr(args, 'ocr', False):
+        scale = get_display_scale()
+        x = px_to_pt(x, scale)
+        y = px_to_pt(y, scale)
+    result = native_mouse_move(x, y)
+    result["ocr_coords"] = {"original_x": args.x, "original_y": args.y} if getattr(args, 'ocr', False) else None
     json_output(result)
 
 
 def run_position(args):
     result = native_mouse_position()
+    json_output(result)
+
+
+def run_calibrate(args):
+    """Show display scale factor and test coordinate conversion."""
+    scale = get_display_scale()
+    pos = native_mouse_position()
+
+    # Get screen resolution info
+    screen_pts = {}
+    screen_px = {}
+    try:
+        r = subprocess.run(
+            ["osascript", "-e", "tell app \"Finder\" to get bounds of window of desktop"],
+            capture_output=True, text=True, timeout=5
+        )
+        if r.returncode == 0:
+            parts = [int(x.strip()) for x in r.stdout.strip().split(",")]
+            screen_pts = {"width": parts[2] - parts[0], "height": parts[3] - parts[1]}
+    except Exception:
+        pass
+
+    try:
+        import tempfile
+        tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+        tmp.close()
+        subprocess.run(["screencapture", "-x", tmp.name], timeout=5, capture_output=True)
+        try:
+            from PIL import Image
+            px_size = Image.open(tmp.name).size
+            screen_px = {"width": px_size[0], "height": px_size[1]}
+        except ImportError:
+            pass
+        os.unlink(tmp.name)
+    except Exception:
+        pass
+
+    result = {
+        "status": "ok",
+        "display_scale": scale,
+        "is_retina": scale >= 2.0,
+        "screen_points": screen_pts,
+        "screen_pixels": screen_px,
+        "mouse_position_points": pos if pos.get("status") == "ok" else None,
+    }
+
+    if screen_pts and screen_px:
+        result["note"] = (
+            f"Screen is {screen_px.get('width')}x{screen_px.get('height')} px "
+            f"= {screen_pts.get('width')}x{screen_pts.get('height')} pts "
+            f"(scale {scale}x). Use --ocr on click/mouse to auto-convert OCR pixel coords."
+        )
+
     json_output(result)
 
 
@@ -882,7 +1012,12 @@ def run_serve(args):
             elif cmd == "tree":
                 return native_accessibility_tree()
             elif cmd == "click":
-                return native_mouse_click(data.get("x"), data.get("y"))
+                x, y = data.get("x"), data.get("y")
+                if data.get("ocr"):
+                    scale = get_display_scale()
+                    x = px_to_pt(x, scale)
+                    y = px_to_pt(y, scale)
+                return native_mouse_click(x, y)
             elif cmd == "type":
                 return native_type_text(data.get("text", ""))
             elif cmd == "key":
@@ -892,7 +1027,12 @@ def run_serve(args):
             elif cmd == "position":
                 return native_mouse_position()
             elif cmd == "mouse":
-                return native_mouse_move(data.get("x"), data.get("y"))
+                x, y = data.get("x"), data.get("y")
+                if data.get("ocr"):
+                    scale = get_display_scale()
+                    x = px_to_pt(x, scale)
+                    y = px_to_pt(y, scale)
+                return native_mouse_move(x, y)
             elif cmd == "cdp-tabs":
                 return cdp_process_tabs()
             elif cmd == "cdp-file":
@@ -1007,6 +1147,8 @@ def main():
     p = sub.add_parser("click", help="Physical mouse click")
     p.add_argument("x", type=int)
     p.add_argument("y", type=int)
+    p.add_argument("--ocr", action="store_true",
+                   help="Coords are OCR pixel values, auto-convert to screen points (Retina-aware)")
     p.set_defaults(func=run_click)
 
     p = sub.add_parser("type", help="Type text at current focus")
@@ -1022,13 +1164,18 @@ def main():
     p.add_argument("dy", type=int, nargs="?", default=3)
     p.set_defaults(func=run_scroll)
 
-    p = sub.add_parser("mouse", help="Move mouse")
+    p = sub.add_parser("mouse", help="Move mouse to coordinates")
     p.add_argument("x", type=int)
     p.add_argument("y", type=int)
+    p.add_argument("--ocr", action="store_true",
+                   help="Coords are OCR pixel values, auto-convert to screen points (Retina-aware)")
     p.set_defaults(func=run_mouse)
 
     p = sub.add_parser("position", help="Get mouse position")
     p.set_defaults(func=run_position)
+
+    p = sub.add_parser("calibrate", help="Show display scale factor and coordinate conversion info")
+    p.set_defaults(func=run_calibrate)
 
     # CDP operations
     p = sub.add_parser("cdp-click", help="Browser click via CDP")
