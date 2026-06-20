@@ -161,50 +161,47 @@ def native_ocr(image_path=None, window_name=None):
 
 
 def get_display_scale():
-    """Get the main screen's backing scale factor (2.0 for Retina, 1.0 for standard).
+    """Auto-detect display scale factor by comparing pixel vs point dimensions.
 
-    Uses `system_profiler` or `screen` query to detect Retina.
-    Falls back to `defaults` or `screencapture` comparison.
+    Takes a screencapture, reads its pixel size via `sips` (built-in macOS),
+    compares to the logical point size from AppleScript. Works on any display:
+    Retina (2x), 4K/5K external (any scaling), 2K (1x), etc.
+
+    Returns:
+        float: Scale factor (e.g. 2.0, 1.5, 1.0). Never fails — returns 1.0 as fallback.
     """
-    try:
-        r = subprocess.run(
-            ["system_profiler", "SPDisplaysDataType", "-json"],
-            capture_output=True, text=True, timeout=5
-        )
-        if r.returncode == 0:
-            data = json.loads(r.stdout)
-            displays = data.get("SPDisplaysDataType", [])
-            for d in displays:
-                if d.get("spdisplays_retina") == "spdisplays_retina-yes":
-                    return 2.0
-    except Exception:
-        pass
-
-    # Fallback: compare point-based vs pixel-based screen size
+    # Get logical point dimensions
     try:
         r = subprocess.run(
             ["osascript", "-e", "tell app \"Finder\" to get bounds of window of desktop"],
             capture_output=True, text=True, timeout=5
         )
+        if r.returncode != 0:
+            return 1.0
+        parts = [int(x.strip()) for x in r.stdout.strip().split(",")]
+        pt_w = parts[2] - parts[0]
+    except Exception:
+        return 1.0
+
+    # Take a quick screenshot and read pixel dimensions via sips
+    import tempfile
+    tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+    tmp.close()
+    try:
+        subprocess.run(["screencapture", "-x", tmp.name], timeout=5,
+                       capture_output=True)
+        r = subprocess.run(["sips", "-g", "pixelWidth", "-g", "pixelHeight", tmp.name],
+                           capture_output=True, text=True, timeout=5)
         if r.returncode == 0:
-            parts = [int(x.strip()) for x in r.stdout.strip().split(",")]
-            pt_w = parts[2] - parts[0]
-            # screencapture on Retina gives twice the points
-            import tempfile
-            tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
-            tmp.close()
-            subprocess.run(["screencapture", "-x", tmp.name], timeout=5, capture_output=True)
-            try:
-                from PIL import Image
-                px_w = Image.open(tmp.name).size[0]
-                scale = round(px_w / pt_w, 1)
-                return scale
-            except ImportError:
-                pass
-            finally:
-                os.unlink(tmp.name)
+            for line in r.stdout.splitlines():
+                if "pixelWidth:" in line:
+                    px_w = int(line.split(":")[1].strip())
+                    scale = round(px_w / pt_w, 1)
+                    return max(1.0, scale)  # don't go below 1x
     except Exception:
         pass
+    finally:
+        os.unlink(tmp.name)
 
     return 1.0
 
@@ -609,10 +606,20 @@ def run_calibrate(args):
         tmp.close()
         subprocess.run(["screencapture", "-x", tmp.name], timeout=5, capture_output=True)
         try:
-            from PIL import Image
-            px_size = Image.open(tmp.name).size
-            screen_px = {"width": px_size[0], "height": px_size[1]}
-        except ImportError:
+            r = subprocess.run(
+                ["sips", "-g", "pixelWidth", "-g", "pixelHeight", tmp.name],
+                capture_output=True, text=True, timeout=5
+            )
+            if r.returncode == 0:
+                px_w, px_h = None, None
+                for line in r.stdout.splitlines():
+                    if "pixelWidth:" in line:
+                        px_w = int(line.split(":")[1].strip())
+                    if "pixelHeight:" in line:
+                        px_h = int(line.split(":")[1].strip())
+                if px_w and px_h:
+                    screen_px = {"width": px_w, "height": px_h}
+        except Exception:
             pass
         os.unlink(tmp.name)
     except Exception:
